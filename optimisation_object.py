@@ -1,5 +1,6 @@
 
 
+from association_measures.hsic import precompute_kernels
 import jax.numpy as np
 
 import numpy.typing as npt
@@ -13,12 +14,13 @@ from jax import random
 from jax import jacfwd, jacrev
 from jax.numpy import linalg
 from penalties import penalty_dic
-
+from functools import partial
 from association_measures.kernel_tools import check_vector
 from tqdm import trange
 
 available_am = ["PC", "DC", "TR", "HSIC", "cMMD", "pearson_correlation"]
 kernel_am = ["HSIC", "cMMD"]
+precomputed_am = ["HSIC", "cMMD"]
 available_kernels = ["distance", "gaussian", "linear"]
 
 class DC_Lasso(BaseEstimator, TransformerMixin):
@@ -47,21 +49,20 @@ class DC_Lasso(BaseEstimator, TransformerMixin):
         self.kernel = kernel
         self.normalise_input = normalise_input
         self.penalty = penalty
+        self.precompute = measure_stat in precomputed_am
 
-    def get_assoc(self, x, y=None):
+    def get_assoc(self, x, y=None, **kwargs):
 
         args = {}
         if self.measure_stat in kernel_am:
             args["kernel"] = self.kernel
-            if self.measure_stat == "HSIC":
-                args["normalised"] = self.normalised
 
         if self.normalise_input:
             x = x / np.linalg.norm(x, ord=2, axis=0)
 
         assoc_func = self.get_association_measure()
 
-        return assoc_func(x, y, **args)
+        return assoc_func(x, y, **args, **kwargs)
 
     def fit(
         self,
@@ -96,29 +97,50 @@ class DC_Lasso(BaseEstimator, TransformerMixin):
             key = random.PRNGKey(seed)
 
         X, y = check_X_y(X, y)
+        X = np.asarray(X)
         n, p = X.shape
+
+        ny, = y.shape
+        assert n == ny
         y = check_vector(y)
 
-        D = am.tr
-        D = jit(D)
-        Dxy = D(X, y)
-        Dxx = D(X)
-        import pdb; pdb.set_trace()
+        D = self.get_assoc
+
+        if self.precompute:
+            #mostly for HSIC and cMMD
+            indicesX = np.arange(p)
+            indicesY = np.arange(1)
+            jit_precompute_kernels = jit(precompute_kernels)
+            @jit
+            def precompX(k):
+                return jit_precompute_kernels(X[:, k])
+            def precompY(k):
+                return jit_precompute_kernels(y[:, k])
+            Kx = vmap(precompX)(indicesX)
+            Ky = vmap(precompY)(indicesY)
+            Dxy = D(X, y, precompute=(Kx, Ky))
+            Dxx = D(X, precompute=(Kx,))
+        else:
+            # D = jit(D)
+            Dxy = D(X, y)
+            Dxx = D(X)
 
 
         def formula(theta):
-            return (theta * Dxy[:, 0]).sum() + 0.5 * (theta * (Dxx * theta).T).sum() + self.penalty_func(theta)
+            return (theta * Dxy).sum() + 0.5 * (theta * (Dxx * theta).T).sum() + self.penalty_func(theta)
 
         minfunc = vmap( formula )
         J = jacfwd(formula)
-        def minJacobian(x): return x - 0.001*J(x)  
-        domain = random.uniform(key, shape=(p,), dtype='float32',minval=-5.0, maxval=5.0)
+        def minJacobian(x): return x - 0.000001*J(x)  
+        theta = random.uniform(key, shape=(p,), dtype='float32',minval=.0, maxval=5.0)
 
         vfuncHS = vmap(minJacobian)
         for epoch in trange(150):
-            domain = vfuncHS(domain)
+            theta = vfuncHS(theta)
+            # positivity constraint
+            theta = theta.clip(0)
 
-        minimums = minfunc(domain)
+        minimums = minfunc(theta)
         import pdb; pdb.set_trace()
         return self
 
@@ -160,8 +182,8 @@ class DC_Lasso(BaseEstimator, TransformerMixin):
             raise ValueError(error_msg)
         return f
 
-    def penalty_func(self):
-        return penalty_dic[self.penalty]
+    def penalty_func(self, theta):
+        return penalty_dic[self.penalty](theta)
 
     def _more_tags(self):
         return {"stateless": True}

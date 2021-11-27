@@ -3,7 +3,7 @@ from tqdm import trange
 from jax import vmap, pmap
 from jax import jit
 
-def perform_loop(func, X, Y):
+def perform_loop(func, X, Y, **args):
     n, d = X.shape
     if Y is not None:
         ny, nd = Y.shape
@@ -14,17 +14,25 @@ def perform_loop(func, X, Y):
         Y = X
         nd = d
 
-    stats = np.zeros((d, nd))
-
     if nd == d:
         indices = np.triu_indices(d, k=0, m=nd)
     else:
         indices = np.triu_indices(d, k=-d, m=nd)
-    #indices = np.stack(indices, axis=0)
-    def func_with_indices(i,j):
-        return func(X[:,i], Y[:,j])
 
-    size = indices[0].shape[0]
+    #indices = np.stack(indices, axis=0)
+    if 'precompute' in args.keys():
+        if len(args['precompute']) == 1:
+            Kx = args['precompute'][0]
+            def func_with_indices(i,j):
+                return func(X[:,i], Y[:,j], precomp_K=(Kx[i], Kx[j]), **args)
+        else:
+            Kx = args['precompute'][0]
+            Ky = args['precompute'][1]
+            def func_with_indices(i,j):
+                return func(X[:,i], Y[:,j], precomp_K=(Kx[i], Ky[j]), **args)
+    else:
+        def func_with_indices(i,j):
+            return func(X[:,i], Y[:,j], **args)
 
     result = vmap(func_with_indices)(indices[0], indices[1])
 
@@ -54,7 +62,7 @@ def association_measure(func):
     The model parameters once fitted will be alpha_indices.
     """
 
-    def am(X, Y=None):
-        output = perform_loop(func, X, Y)
+    def am(X, Y=None, **args):
+        output = perform_loop(func, X, Y, **args)
         return output
     return am
